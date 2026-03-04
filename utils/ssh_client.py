@@ -1,10 +1,13 @@
 import os
-from io import StringIO
 import paramiko
+from io import StringIO
+from utils.bw_utils import get_ssh_key_from_bws
 
 async def run_ssh_command(host: str, command: str, port: int = 22, username: str = "sre-agent", password: str = None) -> str:
     """Connects via SSH and runs a command."""
     key_string = os.getenv("SSH_KEY")
+    if not key_string:
+        key_string = get_ssh_key_from_bws()
     password = password or os.getenv("SSH_PASSWORD")
     
     # Handle host:port format

@@ -1,0 +1,10 @@
+tools:
+  - name: "check_disk_usage"
+    description: "Check free space."
+    category: "read"
+    command: "df -h"
+
+  - name: "check_memory_usage"
+    description: "Check memory usage."
+    category: "read"
+    command: "free -h"

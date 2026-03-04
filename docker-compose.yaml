@@ -1,0 +1,23 @@
+services:
+  # Target server we want to manage via SSH
+  target-host:
+    build:
+      context: .
+      dockerfile: Dockerfile.target
+    environment:
+      - PASSWORD=secretpassword
+
+  # The MCP SRE Tool server
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      - target-host
+    ports:
+      - "8088:8000"
+    environment:
+      - SSH_PASSWORD=secretpassword
+      - SSH_KEY= # Optional, leave empty to test password auth
+    volumes:
+      - .:/app

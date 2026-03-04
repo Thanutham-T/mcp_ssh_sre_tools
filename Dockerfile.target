@@ -1,0 +1,30 @@
+FROM debian:bookworm
+
+# Install SSH server
+RUN apt-get update && apt-get install -y openssh-server iproute2 sudo && \
+    mkdir -p /var/run/sshd
+
+# Create dedicated 'sre-agent' user
+RUN useradd -m -s /bin/bash sre-agent && \
+    echo 'sre-agent:secretpassword' | chpasswd && \
+    usermod -aG sudo sre-agent
+
+# Allow sudo without password for 'sre-agent'
+RUN echo "sre-agent ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+# Set up SSH directory for the user
+RUN mkdir -p /home/sre-agent/.ssh && \
+    echo "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDXH3bTnNQMsiKpfprx1dDRCprPdB+SU6i2Fq030O8QkCgSMLXDw84JjOAEwg6Ip4aUNhjCy/feJsrW5blVWUk042Vw8ljZMrQ875/cVFU1209WjCm1ykpyTpV7aPxcNOYnAv5M3IOd3nbXVCAwS7wW1PjhsQeHWfb6KrL9hL9mx68FcdXfA7+MheQVuaq338Qhr0PxOvm7295iZrz8GZTl1stKXqRAFvrUbmVOhQY/szU8WtY54nipLi6oXKJWD+xs7wOiD1VM/oVDDHAkvaLz9XJCFBnhExKGtKIMTFY4UOacnF92OxI68x1UtJfzFCh3rumO5NqmjEfNEX8XDBtD root@Cohh" > /home/sre-agent/.ssh/authorized_keys && \
+    chmod 700 /home/sre-agent/.ssh && \
+    chmod 600 /home/sre-agent/.ssh/authorized_keys && \
+    chown -R sre-agent:sre-agent /home/sre-agent/.ssh
+
+# Configure SSH server
+RUN sed -i 's/#Port 22/Port 27036/' /etc/ssh/sshd_config
+RUN sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+RUN sed -i 's/PermitRootLogin prohibit-password/PermitRootLogin no/' /etc/ssh/sshd_config
+
+# Expose ssh port
+EXPOSE 27036
+
+CMD ["/usr/sbin/sshd", "-D"]

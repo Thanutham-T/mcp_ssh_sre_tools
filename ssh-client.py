@@ -2,9 +2,10 @@ import os
 from io import StringIO
 import paramiko
 
-async def run_ssh_command(host: str, command: str, port: int = 22) -> str:
+async def run_ssh_command(host: str, command: str, port: int = 22, username: str = "sre-agent", password: str = None) -> str:
     """Connects via SSH and runs a command."""
     key_string = os.getenv("SSH_KEY")
+    password = password or os.getenv("SSH_PASSWORD")
     
     # Handle host:port format
     if ":" in host:
@@ -17,12 +18,26 @@ async def run_ssh_command(host: str, command: str, port: int = 22) -> str:
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     
-    # Load key from memory (StringIO)
-    pkey = paramiko.RSAKey.from_private_key(StringIO(key_string))
+    pkey = None
+    if key_string:
+        try:
+            # Load key from memory (StringIO)
+            pkey = paramiko.RSAKey.from_private_key(StringIO(key_string))
+        except Exception as e:
+            # If key loading fails, we'll try password if available
+            pass
 
     try:
-        # Connect as the dedicated 'sre-agent' user
-        client.connect(hostname=host, port=port, username="sre-agent", pkey=pkey, timeout=15)
+        # Connect using pkey, password, or both
+        client.connect(
+            hostname=host, 
+            port=port, 
+            username=username, 
+            pkey=pkey, 
+            password=password,
+            timeout=15,
+            look_for_keys=False if pkey else True
+        )
         stdin, stdout, stderr = client.exec_command(command)
 
         result = stdout.read().decode()

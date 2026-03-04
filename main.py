@@ -1,6 +1,7 @@
-def main():
-    print("Hello from mcp-ssh-sre-tools!")
+from mcp.server.fastmcp import FastMCP
 
+mcp = FastMCP("sre-ssh-server")
 
 if __name__ == "__main__":
-    main()
+    # Start the server using SSE transport
+    mcp.run(transport="sse")

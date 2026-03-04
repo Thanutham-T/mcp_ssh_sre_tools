@@ -13,9 +13,9 @@ def register_tools(mcp: FastMCP, yaml_path: str):
 
         # Use a factory function to correctly capture cmd_template in the closure
         def get_handler(template):
-            async def create_handler(host: str) -> str:
+            async def create_handler(host: str, port: int) -> str:
                 # Inject arguments into the command string
-                return await run_ssh_command(host, cmd_template)
+                return await run_ssh_command(host=host, command=template, port=port)
             return create_handler
 
         # Register with MCP

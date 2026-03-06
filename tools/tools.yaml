@@ -1,10 +1,181 @@
+# ==============================================================================
+# MCP Tool Definitions — SRE Alert Resolution Agent
+# Scenarios: High CPU Usage & High Memory Usage (Debian / Docker)
+# ==============================================================================
+# Categories:
+#   read    → Safe, non-mutating. Agent may call freely.
+#   execute → Mutating / impactful. Agent MUST obtain user approval first.
+# ==============================================================================
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SHARED TOOLS  (used in both CPU and Memory scenarios)
+# ──────────────────────────────────────────────────────────────────────────────
+
 tools:
-  - name: "check_disk_usage"
-    description: "Check free space."
+  - name: "check_system_load"
+    description: |
+      Read the system's current load averages (1, 5, 15 minutes) and uptime.
+      Use this as the first triage step to gauge overall system pressure before
+      drilling into CPU or memory. A load average significantly higher than the
+      number of CPU cores indicates the system is overloaded.
     category: "read"
-    command: "df -h"
+    command: "uptime"
+
+  - name: "check_running_processes"
+    description: |
+      List all running processes sorted by CPU consumption (highest first),
+      showing PID, owner, CPU%, memory%, RSS, and full command line.
+      Use this to surface runaway processes immediately after confirming
+      high load average or high CPU utilisation.
+    category: "read"
+    command: "ps aux --sort=-%cpu | head -n 21"
+
+  - name: "check_process_detail"
+    description: |
+      Retrieve detailed information for a specific process by PID.
+      Returns PID, PPID, owner, CPU%, memory%, start time, elapsed time,
+      and full command. Use this to confirm a suspicious process identity
+      before taking any remediation action. Replace {pid} with the target PID.
+    category: "read"
+    command: "ps -p {pid} -o pid,ppid,user,%cpu,%mem,lstart,etime,cmd"
+
+  - name: "kill_process"
+    description: |
+      EXECUTE — Requires user approval before running.
+      Send SIGKILL (signal 9) to forcefully and immediately terminate a process.
+      SIGKILL cannot be caught or ignored — the process stops without any cleanup,
+      which may cause data loss if it was writing to disk. Use only after
+      confirming the correct PID via check_process_detail and when gentler
+      approaches (renice, SIGTERM) have failed or are not appropriate.
+      Replace {pid} with the target PID.
+    category: "execute"
+    command: "sudo kill -9 {pid}"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SCENARIO 1 — HIGH CPU USAGE
+# ──────────────────────────────────────────────────────────────────────────────
+
+  - name: "check_cpu_usage"
+    description: |
+      Capture a single non-interactive snapshot of CPU utilisation across all
+      cores. Reports %us (user-space), %sy (kernel), %id (idle), and %wa (I/O wait).
+      High %us points to an application process; high %sy may indicate a fork bomb
+      or heavy I/O; high %wa points to a disk or storage bottleneck rather than CPU.
+    category: "read"
+    command: "top -bn1 | head -n 5"
+
+  - name: "check_cpu_per_core"
+    description: |
+      Display CPU utilisation broken down per logical core for one sampling interval.
+      Use this to distinguish a single-threaded runaway process saturating one core
+      from a multi-threaded workload saturating all cores. Requires the sysstat
+      package to be installed (mpstat command).
+    category: "read"
+    command: "mpstat -P ALL 1 1"
+
+  - name: "check_cpu_by_process"
+    description: |
+      List the top 10 processes consuming the most CPU at this instant, showing
+      user, PID, CPU%, memory%, and command. Use this after check_cpu_usage confirms
+      high CPU to surface the exact PIDs responsible for the spike.
+    category: "read"
+    command: "ps aux --sort=-%cpu | awk 'NR<=11{print $1,$2,$3,$4,$11}'"
+
+  - name: "check_cpu_kernel_log"
+    description: |
+      Search the kernel ring buffer for CPU-related warnings such as soft lockups,
+      hung tasks, or thermal throttling events. Use this when CPU is high but no
+      obvious user-space process is responsible, which may indicate a kernel or
+      hardware-level issue requiring escalation.
+    category: "read"
+    command: "dmesg | grep -iE 'cpu|hung|lockup|throttl' | tail -n 30"
+
+  - name: "renice_process"
+    description: |
+      EXECUTE — Requires user approval before running.
+      Lower the CPU scheduling priority of a process by setting its nice value
+      to +10, reducing the CPU time it receives without stopping it. This is the
+      preferred first remediation step for legitimate processes (cron jobs, batch
+      pipelines) that are consuming too much CPU at the wrong time. Less risky than
+      kill. Replace {pid} with the target PID.
+    category: "execute"
+    command: "renice +10 -p {pid}"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SCENARIO 2 — HIGH MEMORY USAGE / OOM RISK
+# ──────────────────────────────────────────────────────────────────────────────
 
   - name: "check_memory_usage"
-    description: "Check memory usage."
+    description: |
+      Display a human-readable summary of total, used, free, buff/cache, and
+      available RAM plus swap usage. Focus on the "available" column — this is
+      the true usable memory (including reclaimable cache), not the "free" column.
+      Use this as the first call when any memory or OOM alert fires.
     category: "read"
     command: "free -h"
+
+  - name: "check_memory_details"
+    description: |
+      Read the kernel's full memory accounting from /proc/meminfo including
+      MemAvailable, Buffers, Cached, Slab, PageTables, CommitLimit, and
+      Committed_AS. Use this when free -h shows pressure but more granularity
+      is needed, for example to distinguish page cache from actual application
+      memory, or to check if the system is overcommitting memory.
+    category: "read"
+    command: "cat /proc/meminfo"
+
+  - name: "check_memory_by_process"
+    description: |
+      List the top 10 processes consuming the most resident memory (RSS), showing
+      user, PID, CPU%, memory%, VSZ, RSS, and command. RSS reflects actual physical
+      RAM in use, making it the most relevant metric for diagnosing memory pressure.
+      Use this after check_memory_usage confirms high memory to identify the
+      responsible process.
+    category: "read"
+    command: "ps aux --sort=-%mem | awk 'NR<=11{print $1,$2,$3,$4,$5,$6,$11}' | column -t"
+
+  - name: "check_process_memory_detail"
+    description: |
+      Read detailed memory metrics for a specific process directly from the kernel
+      via /proc/{pid}/status. Returns VmPeak (peak virtual memory), VmRSS (current
+      physical RAM), VmSwap (how much is swapped out), and thread count. Use this
+      to confirm actual RAM vs swap consumption for a suspicious PID before deciding
+      on remediation. Replace {pid} with the target PID.
+    category: "read"
+    command: "cat /proc/{pid}/status | grep -E 'Name|VmPeak|VmRSS|VmSwap|Threads'"
+
+  - name: "check_oom_logs"
+    description: |
+      Search the kernel ring buffer for OOM Killer events, revealing which process
+      was killed, when, and its oom_score at the time. Use this early in any memory
+      investigation to determine whether the kernel has already started killing
+      processes, and to identify the victim process for further diagnosis.
+    category: "read"
+    command: "dmesg | grep -iE 'oom|out of memory|killed process|memory pressure' | tail -n 30"
+
+  - name: "check_swap_by_process"
+    description: |
+      Scan all running processes and list those using swap space, sorted by swap
+      consumption (highest first). High per-process swap combined with low available
+      RAM indicates severe memory pressure and risk of system unresponsiveness.
+      Use this after check_memory_usage shows heavy swap usage to pinpoint the cause.
+    category: "read"
+    command: >
+      for pid in /proc/[0-9]*; do
+        awk '/VmSwap/{swap=$2} /Name/{name=$2} END{if(swap+0>0) printf "%s %s kB\n", name, swap}'
+        $pid/status 2>/dev/null;
+      done | sort -k2 -rn | head -20
+
+  - name: "drop_page_cache"
+    description: |
+      EXECUTE — Requires user approval before running.
+      Instruct the kernel to release pagecache, dentries, and inodes (level 3 drop),
+      reclaiming memory used by the disk read cache without affecting application memory.
+      Use this as a low-risk first remediation step when buff/cache is large and
+      available memory is critically low but no application process is leaking memory.
+      Applications may see a temporary I/O slowdown as the cache repopulates.
+    category: "execute"
+    command: "sync && echo 3 > /proc/sys/vm/drop_caches"

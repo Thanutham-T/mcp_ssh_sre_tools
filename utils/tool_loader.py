@@ -12,7 +12,16 @@ def register_tools(mcp: FastMCP, yaml_path: str):
     for tool_def in config["tools"]:
         name = tool_def["name"]
         description = tool_def["description"]
+        category = tool_def.get("category", "read")
+
         cmd_template = tool_def["command"]
+
+        if category == "execute":
+            description = (
+                f"EXECUTE — Requires user approval before running.\n{description}"
+            )
+
+        description = f"{description}\n\nCommand: {cmd_template}"
 
         # Parse placeholders from the command (e.g., {pid})
         placeholders = re.findall(r"\{(\w+)\}", cmd_template)

@@ -42,7 +42,6 @@ tools:
 
   - name: "kill_process"
     description: |
-      EXECUTE — Requires user approval before running.
       Send SIGKILL (signal 9) to forcefully and immediately terminate a process.
       SIGKILL cannot be caught or ignored — the process stops without any cleanup,
       which may cause data loss if it was writing to disk. Use only after
@@ -94,7 +93,6 @@ tools:
 
   - name: "renice_process"
     description: |
-      EXECUTE — Requires user approval before running.
       Lower the CPU scheduling priority of a process by setting its nice value
       to +10, reducing the CPU time it receives without stopping it. This is the
       preferred first remediation step for legitimate processes (cron jobs, batch
@@ -171,7 +169,6 @@ tools:
 
   - name: "drop_page_cache"
     description: |
-      EXECUTE — Requires user approval before running.
       Instruct the kernel to release pagecache, dentries, and inodes (level 3 drop),
       reclaiming memory used by the disk read cache without affecting application memory.
       Use this as a low-risk first remediation step when buff/cache is large and

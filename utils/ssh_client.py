@@ -38,7 +38,6 @@ def _load_private_key(key_string: str) -> paramiko.PKey | None:
         paramiko.RSAKey,
         paramiko.Ed25519Key,
         paramiko.ECDSAKey,
-        paramiko.DSSKey,
     ]
     for cls in key_classes:
         try:
@@ -56,7 +55,7 @@ async def run_ssh_command(
     port: int = _DEFAULT_PORT,
     username: str = _DEFAULT_USERNAME,
     password: str | None = None,
-) -> str:
+) -> dict:
     """Connect to *host* via SSH and run *command*, returning the output.
 
     Args:
@@ -68,7 +67,9 @@ async def run_ssh_command(
         password: Optional password.  Falls back to ``SSH_PASSWORD`` env var.
 
     Returns:
-        stdout output on success, or an error message string on failure.
+        A dictionary containing:
+        - tool_result: "success" or "fail"
+        - command_result: stdout/stderr output or error message
     """
     # ── Resolve host:port shorthand ──────────────────────────────────────────
     if ":" in host:
@@ -102,27 +103,44 @@ async def run_ssh_command(
         )
         logger.debug("SSH connected to %s:%d as %s", host, port, username)
 
-        _, stdout, stderr = client.exec_command(command)
+        stdin, stdout, stderr = client.exec_command(command)
+
+        # stdout.read() and stderr.read() block until the command finishes
         output = stdout.read().decode()
         error = stderr.read().decode()
+        exit_status = stdout.channel.recv_exit_status()
 
-        if output:
-            return output
+        # Combine stdout and stderr for the final response
+        full_output = output
         if error:
-            logger.warning("SSH command produced stderr on %s: %s", host, error.strip())
-            return f"Error: {error}"
-        return ""  # command succeeded with no output
+            if full_output and not full_output.endswith("\n"):
+                full_output += "\n"
+            full_output += error
+
+        if exit_status == 0:
+            return {"tool_result": "success", "command_result": full_output}
+        else:
+            logger.warning(
+                "SSH command failed (exit code %d) on %s: %s",
+                exit_status,
+                host,
+                error.strip(),
+            )
+            return {"tool_result": "fail", "command_result": full_output}
 
     except paramiko.AuthenticationException:
-        logger.error("SSH authentication failed for %s@%s:%d", username, host, port)
-        return (
+        msg = (
             f"SSH Authentication Failed: check credentials for {username}@{host}:{port}"
         )
+        logger.error(msg)
+        return {"tool_result": "fail", "command_result": msg}
     except paramiko.SSHException as exc:
+        msg = f"SSH Error: {exc}"
         logger.error("SSH error on %s:%d — %s", host, port, exc)
-        return f"SSH Error: {exc}"
+        return {"tool_result": "fail", "command_result": msg}
     except OSError as exc:
+        msg = f"Connection Error: {exc}"
         logger.error("Network error connecting to %s:%d — %s", host, port, exc)
-        return f"Connection Error: {exc}"
+        return {"tool_result": "fail", "command_result": msg}
     finally:
         client.close()

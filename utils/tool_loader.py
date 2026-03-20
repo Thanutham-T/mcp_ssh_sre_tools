@@ -7,12 +7,12 @@ as a FastMCP tool with a properly-typed handler signature.
 YAML schema (each item under ``tools:``):
     name        (str)  — tool identifier exposed to the LLM
     description (str)  — human-readable description shown to the LLM
-    command     (str)  — shell command template; use {placeholder} for args
+    command     (str)  — shell command template; use <placeholder> for args
     category    (str)  — "read" (default) | "execute"
                          "execute" tools are prefixed with an approval notice
 
 Dynamic parameters:
-    Every ``{placeholder}`` found in the command template (except ``host`` and
+    Every ``<placeholder>`` found in the command template (except ``host`` and
     ``port``, which are always present) becomes a required string argument.
     ``host`` is always required; ``port`` defaults to 22.
 """
@@ -39,25 +39,39 @@ def _build_description(tool_def: dict) -> str:
     return f"{desc}\n\nCommand: {tool_def['command'].strip()}"
 
 
-def _make_handler(cmd_template: str, placeholders: list[str]):
-    """Return an async handler function whose signature matches *placeholders*.
+def _make_handler(cmd_template: str, placeholder_map: dict[str, str]):
+    """Return an async handler function whose signature matches the values
+    in *placeholder_map*.
 
-    The handler replaces ``{placeholder}`` tokens in *cmd_template* with the
-    values supplied at call time, then delegates to ``run_ssh_command``.
+    The handler replaces tokens in *cmd_template* using the mapping:
+    normalized_name -> original_placeholder.
 
     A custom ``__signature__`` is attached so that FastMCP can derive the
     correct JSON schema to expose to the LLM.
     """
 
-    async def handler(host: str, port: int = 22, **kwargs) -> str:
-        # Build the substitution context
-        context = {"host": host, "port": port, **kwargs}
+    async def handler(host: str, port: int = 22, **kwargs) -> dict:
+        # Build the substitution context (including host and port)
+        # and normalize all keys to lowercase for internal mapping
+        context = {"host": host, "port": port}
+        context.update(kwargs)
 
-        # Replace each {placeholder} in the template (avoids str.format issues
-        # with shell characters like { } in the surrounding command text)
+        # Perform replacements
         command = cmd_template
-        for key, value in context.items():
-            command = command.replace(f"{{{key}}}", str(value))
+
+        # Replace placeholders using the normalized name map
+        # This handles custom placeholders (e.g. <PID>) as well as <host> or <port>
+        for norm_name, original_placeholder in placeholder_map.items():
+            if norm_name in context:
+                command = command.replace(
+                    f"<{original_placeholder}>", str(context[norm_name])
+                )
+        
+        # Fallback for explicit <host> and <port> if they weren't in placeholder_map
+        # (though they should be if they used the <name> syntax)
+        for key in ("host", "port"):
+            if f"<{key}>" in command:
+                command = command.replace(f"<{key}>", str(context[key]))
 
         return await run_ssh_command(
             host=host,
@@ -75,11 +89,11 @@ def _make_handler(cmd_template: str, placeholders: list[str]):
         ),
     ]
 
-    for name in placeholders:
-        if name not in ("host", "port"):
+    for norm_name in placeholder_map:
+        if norm_name not in ("host", "port"):
             params.append(
                 inspect.Parameter(
-                    name, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=str
+                    norm_name, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=str
                 )
             )
 
@@ -117,11 +131,21 @@ def register_tools(mcp: FastMCP, yaml_path: str) -> None:
         name = tool_def["name"]
         cmd_template = tool_def["command"]
         description = _build_description(tool_def)
-        placeholders = re.findall(r"\{(\w+)\}", cmd_template)
 
-        handler = _make_handler(cmd_template, placeholders)
+        # Find all <placeholder> tokens
+        raw_placeholders = re.findall(r"<(\w+)>", cmd_template)
+
+        # Create a map from lowercase_name -> original_case_placeholder
+        # e.g. {"pid": "PID", "service_name": "SERVICE_NAME"}
+        placeholder_map = {}
+        for p in raw_placeholders:
+            placeholder_map[p.lower()] = p
+
+        handler = _make_handler(cmd_template, placeholder_map)
         mcp.tool(name=name, description=description)(handler)
 
         logger.debug(
-            "Registered tool '%s' (placeholders: %s)", name, placeholders or "none"
+            "Registered tool '%s' (parameters: %s)",
+            name,
+            list(placeholder_map.keys()) or "none",
         )

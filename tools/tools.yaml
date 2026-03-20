@@ -1,6 +1,11 @@
 # ==============================================================================
 # MCP Tool Definitions — SRE Alert Resolution Agent
-# Scenarios: High CPU Usage & High Memory Usage (Debian / Docker)
+# Alert: High CPU Usage
+# Scenarios:
+#   1. Runaway Single Process
+#   2. Fork Bomb / Process Explosion
+#   3. Disk I/O Wait
+#   4. Scheduled Job Spike (Cron)
 # ==============================================================================
 # Categories:
 #   read    → Safe, non-mutating. Agent may call freely.
@@ -9,7 +14,7 @@
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SHARED TOOLS  (used in both CPU and Memory scenarios)
+# SHARED TOOLS  (used across all High CPU scenarios)
 # ──────────────────────────────────────────────────────────────────────────────
 
 tools:
@@ -20,159 +25,312 @@ tools:
       drilling into CPU or memory. A load average significantly higher than the
       number of CPU cores indicates the system is overloaded.
     category: "read"
-    command: "uptime"
+    command: uptime
 
-  - name: "check_running_processes"
+  - name: "list_top_cpu_processes"
     description: |
-      List all running processes sorted by CPU consumption (highest first),
-      showing PID, owner, CPU%, memory%, RSS, and full command line.
-      Use this to surface runaway processes immediately after confirming
-      high load average or high CPU utilisation.
+      List all running processes sorted by CPU usage, highest first.
+      Shows PID, user, %CPU, %MEM, and command name.
+      Use this immediately after check_system_load to identify which process
+      is consuming the most CPU. The top entry is usually the suspect.
     category: "read"
-    command: "ps aux --sort=-%cpu | head -n 21"
+    command: ps aux --sort=-%cpu | head -15
 
-  - name: "check_process_detail"
+  - name: "get_cpu_breakdown"
     description: |
-      Retrieve detailed information for a specific process by PID.
-      Returns PID, PPID, owner, CPU%, memory%, start time, elapsed time,
-      and full command. Use this to confirm a suspicious process identity
-      before taking any remediation action. Replace {pid} with the target PID.
+      Show a real-time CPU usage breakdown: user, system, iowait, idle, etc.
+      Run 3 samples at 2-second intervals for a short trend snapshot.
+      High %us = compute-bound process. High %wa = disk I/O bottleneck.
+      High %sy = excessive syscalls or context switching.
     category: "read"
-    command: "ps -p {pid} -o pid,ppid,user,%cpu,%mem,lstart,etime,cmd"
+    command: top -b -n3 -d2 | grep '%Cpu'
 
-  - name: "kill_process"
+  - name: "get_cpu_core_count"
     description: |
-      Send SIGKILL (signal 9) to forcefully and immediately terminate a process.
-      SIGKILL cannot be caught or ignored — the process stops without any cleanup,
-      which may cause data loss if it was writing to disk. Use only after
-      confirming the correct PID via check_process_detail and when gentler
-      approaches (renice, SIGTERM) have failed or are not appropriate.
-      Replace {pid} with the target PID.
+      Return the number of logical CPU cores on the host.
+      Use this to contextualise load average readings — a load of 8.0 is
+      critical on a 2-core host but acceptable on a 16-core one.
+    category: "read"
+    command: nproc
+
+  - name: "get_top_cpu_process"
+    description: |
+      Get the single process consuming the most
+      CPU at this moment. Returns PID, user, %CPU, elapsed time, and command.
+      A value above 90% for a single process strongly indicates a runaway loop
+      or busy-wait. Note the PID for the next investigation steps.
+    category: "read"
+    command: ps aux --sort=-%cpu | awk 'NR==2{print "PID:"$2, "USER:"$1, "CPU:"$3"%", "MEM:"$4"%", "TIME:"$10, "CMD:"$11}'
+
+  - name: "get_process_open_files"
+    description: |
+      List all file descriptors currently open
+      by the suspect process. A process stuck in a tight I/O loop may show
+      repeated access to the same file. Replace <PID> with the actual PID
+      obtained from sc1_get_top_cpu_process.
+    category: "read"
+    command: sudo lsof -p <PID> 2>/dev/null | head -30
+
+  - name: "get_process_stack_trace"
+    description: |
+      Dump the current call stack of the suspect
+      process using py-spy (Python) or strace. Reveals the exact function or
+      syscall the process is looping on without stopping it.
+      Replace <PID> with the actual PID. Requires py-spy to be installed.
+    category: "read"
+    command: sudo py-spy dump --pid <PID> 2>/dev/null || sudo strace -p <PID> -c -e trace=all -- sleep 5 2>&1
+
+  - name: "check_process_cgroup_cpu_limit"
+    description: |
+      Check whether the suspect process or its
+      parent service has a CPU quota set via cgroups or systemd CPUQuota.
+      If no quota is set, the process can consume 100% of a core indefinitely.
+      Replace <SERVICE_NAME> with the systemd unit name if applicable.
+    category: "read"
+    command: systemctl show <SERVICE_NAME> --property=CPUQuota 2>/dev/null || cat /sys/fs/cgroup/cpu/$(ps -o cgroup= -p <PID> 2>/dev/null | head -1)/cpu.cfs_quota_us 2>/dev/null || echo 'no cgroup limit found'
+
+  - name: "graceful_kill_process"
+    description: |
+      Send SIGTERM to the runaway process to
+      request a graceful shutdown. The process has a chance to clean up before
+      exiting. Prefer this over SIGKILL to avoid data corruption.
+      Replace <PID> with the actual PID. REQUIRES USER APPROVAL before execution.
     category: "execute"
-    command: "sudo kill -9 {pid}"
+    command: sudo kill -15 <PID>
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# SCENARIO 1 — HIGH CPU USAGE
-# ──────────────────────────────────────────────────────────────────────────────
-
-  - name: "check_cpu_usage"
+  - name: "force_kill_process"
     description: |
-      Capture a single non-interactive snapshot of CPU utilisation across all
-      cores. Reports %us (user-space), %sy (kernel), %id (idle), and %wa (I/O wait).
-      High %us points to an application process; high %sy may indicate a fork bomb
-      or heavy I/O; high %wa points to a disk or storage bottleneck rather than CPU.
-    category: "read"
-    command: "top -bn1 | head -n 5"
-
-  - name: "check_cpu_per_core"
-    description: |
-      Display CPU utilisation broken down per logical core for one sampling interval.
-      Use this to distinguish a single-threaded runaway process saturating one core
-      from a multi-threaded workload saturating all cores. Requires the sysstat
-      package to be installed (mpstat command).
-    category: "read"
-    command: "mpstat -P ALL 1 1"
-
-  - name: "check_cpu_by_process"
-    description: |
-      List the top 10 processes consuming the most CPU at this instant, showing
-      user, PID, CPU%, memory%, and command. Use this after check_cpu_usage confirms
-      high CPU to surface the exact PIDs responsible for the spike.
-    category: "read"
-    command: "ps aux --sort=-%cpu | awk 'NR<=11{print $1,$2,$3,$4,$11}'"
-
-  - name: "check_cpu_kernel_log"
-    description: |
-      Search the kernel ring buffer for CPU-related warnings such as soft lockups,
-      hung tasks, or thermal throttling events. Use this when CPU is high but no
-      obvious user-space process is responsible, which may indicate a kernel or
-      hardware-level issue requiring escalation.
-    category: "read"
-    command: "dmesg | grep -iE 'cpu|hung|lockup|throttl' | tail -n 30"
-
-  - name: "renice_process"
-    description: |
-      Lower the CPU scheduling priority of a process by setting its nice value
-      to +10, reducing the CPU time it receives without stopping it. This is the
-      preferred first remediation step for legitimate processes (cron jobs, batch
-      pipelines) that are consuming too much CPU at the wrong time. Less risky than
-      kill. Replace {pid} with the target PID.
+      Send SIGKILL to the runaway process,
+      terminating it immediately without cleanup. Use ONLY if SIGTERM
+      (sc1_graceful_kill_process) did not stop the process within 10 seconds.
+      Risk: may leave temp files or incomplete writes. REQUIRES USER APPROVAL.
     category: "execute"
-    command: "renice +10 -p {pid}"
+    command: sudo kill -9 <PID>
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# SCENARIO 2 — HIGH MEMORY USAGE / OOM RISK
-# ──────────────────────────────────────────────────────────────────────────────
-
-  - name: "check_memory_usage"
+  - name: "set_systemd_cpu_quota"
     description: |
-      Display a human-readable summary of total, used, free, buff/cache, and
-      available RAM plus swap usage. Focus on the "available" column — this is
-      the true usable memory (including reclaimable cache), not the "free" column.
-      Use this as the first call when any memory or OOM alert fires.
-    category: "read"
-    command: "free -h"
-
-  - name: "check_memory_details"
-    description: |
-      Read the kernel's full memory accounting from /proc/meminfo including
-      MemAvailable, Buffers, Cached, Slab, PageTables, CommitLimit, and
-      Committed_AS. Use this when free -h shows pressure but more granularity
-      is needed, for example to distinguish page cache from actual application
-      memory, or to check if the system is overcommitting memory.
-    category: "read"
-    command: "cat /proc/meminfo"
-
-  - name: "check_memory_by_process"
-    description: |
-      List the top 10 processes consuming the most resident memory (RSS), showing
-      user, PID, CPU%, memory%, VSZ, RSS, and command. RSS reflects actual physical
-      RAM in use, making it the most relevant metric for diagnosing memory pressure.
-      Use this after check_memory_usage confirms high memory to identify the
-      responsible process.
-    category: "read"
-    command: "ps aux --sort=-%mem | awk 'NR<=11{print $1,$2,$3,$4,$5,$6,$11}' | column -t"
-
-  - name: "check_process_memory_detail"
-    description: |
-      Read detailed memory metrics for a specific process directly from the kernel
-      via /proc/{pid}/status. Returns VmPeak (peak virtual memory), VmRSS (current
-      physical RAM), VmSwap (how much is swapped out), and thread count. Use this
-      to confirm actual RAM vs swap consumption for a suspicious PID before deciding
-      on remediation. Replace {pid} with the target PID.
-    category: "read"
-    command: "cat /proc/{pid}/status | grep -E 'Name|VmPeak|VmRSS|VmSwap|Threads'"
-
-  - name: "check_oom_logs"
-    description: |
-      Search the kernel ring buffer for OOM Killer events, revealing which process
-      was killed, when, and its oom_score at the time. Use this early in any memory
-      investigation to determine whether the kernel has already started killing
-      processes, and to identify the victim process for further diagnosis.
-    category: "read"
-    command: "dmesg | grep -iE 'oom|out of memory|killed process|memory pressure' | tail -n 30"
-
-  - name: "check_swap_by_process"
-    description: |
-      Scan all running processes and list those using swap space, sorted by swap
-      consumption (highest first). High per-process swap combined with low available
-      RAM indicates severe memory pressure and risk of system unresponsiveness.
-      Use this after check_memory_usage shows heavy swap usage to pinpoint the cause.
-    category: "read"
-    command: >
-      for pid in /proc/[0-9]*; do
-        awk '/VmSwap/{swap=$2} /Name/{name=$2} END{if(swap+0>0) printf "%s %s kB\n", name, swap}'
-        $pid/status 2>/dev/null;
-      done | sort -k2 -rn | head -20
-
-  - name: "drop_page_cache"
-    description: |
-      Instruct the kernel to release pagecache, dentries, and inodes (level 3 drop),
-      reclaiming memory used by the disk read cache without affecting application memory.
-      Use this as a low-risk first remediation step when buff/cache is large and
-      available memory is critically low but no application process is leaking memory.
-      Applications may see a temporary I/O slowdown as the cache repopulates.
+      Apply a CPU quota to the systemd service
+      to prevent it from monopolising the CPU again after restart.
+      Sets CPUQuota to 80% as a sensible default. Replace <SERVICE_NAME>
+      with the actual unit name. REQUIRES USER APPROVAL before execution.
     category: "execute"
-    command: "sync && echo 3 > /proc/sys/vm/drop_caches"
+    command: sudo systemctl set-property <SERVICE_NAME> CPUQuota=80% && sudo systemctl daemon-reload
+
+  - name: "count_total_processes"
+    description: |
+      Count the total number of running processes on
+      the system. A value above 500 on a typical 4-core host is abnormal and
+      suggests a fork bomb or uncontrolled spawning. Run this immediately
+      after check_system_load to confirm the process explosion hypothesis.
+    category: "read"
+    command: ps aux | wc -l
+
+  - name: "get_process_count_per_user"
+    description: |
+      Show the number of processes grouped by user,
+      sorted highest first. Identifies which user account is responsible for
+      the process explosion. The top entry is typically the offending user.
+    category: "read"
+    command: ps aux | awk '{print $1}' | sort | uniq -c | sort -rn | head -10
+
+  - name: "check_context_switch_rate"
+    description: |
+      Sample system statistics including context
+      switches per second (cs column) over 5 intervals. A cs value above
+      100,000/sec on a 4-core host indicates the scheduler is overwhelmed
+      by too many runnable processes competing for CPU time.
+    category: "read"
+    command: vmstat 1 5
+
+  - name: "list_zombie_and_dstate_processes"
+    description: |
+      List processes in zombie (Z) or uninterruptible
+      sleep (D) state. A large number of zombie processes indicates a parent
+      is not reaping its children, worsening the process explosion. D-state
+      processes indicate blocked I/O compounding the problem.
+    category: "read"
+    command: ps aux | awk '$8 ~ /^[ZD]/ {print $1,$2,$8,$11}' | head -20
+
+  - name: "check_nproc_ulimit"
+    description: |
+      Show the current max process limit (nproc) for
+      the offending user. If unlimited or very high, the system has no guard
+      against fork bombs. Replace <USERNAME> with the user identified in
+      sc2_get_process_count_per_user.
+    category: "read"
+    command: sudo -u <USERNAME> bash -c 'ulimit -u' 2>/dev/null || grep nproc /etc/security/limits.conf
+
+  - name: "kill_all_processes_by_user"
+    description: |
+      Send SIGKILL to all processes owned by the
+      offending user. This is a broad action that will terminate every process
+      for that user including any legitimate sessions.
+      Replace <USERNAME> with the target user. REQUIRES USER APPROVAL.
+    category: "execute"
+    command: sudo pkill -9 -u <USERNAME> && echo 'All processes for <USERNAME> killed'
+
+  - name: "set_nproc_limit"
+    description: |
+      Append nproc limits for all users to
+      /etc/security/limits.conf to prevent future fork bombs.
+      Sets soft limit 1024 and hard limit 2048.
+      Does NOT affect currently running processes. REQUIRES USER APPROVAL.
+    category: "execute"
+    command: echo '* soft nproc 1024' | sudo tee -a /etc/security/limits.conf && echo '* hard nproc 2048' | sudo tee -a /etc/security/limits.conf && echo 'nproc limits applied'
+
+  - name: "check_iowait_percent"
+    description: |
+      Sample CPU statistics focusing on iowait
+      percentage over 5 intervals. The 'wa' column in top output represents
+      the fraction of time the CPU spent waiting for I/O to complete.
+      A value above 30% confirms that disk I/O — not computation — is the
+      bottleneck causing high CPU utilisation.
+    category: "read"
+    command: iostat -c 2 5
+
+  - name: "get_disk_utilisation"
+    description: |
+      Show per-disk I/O statistics including
+      utilisation (%util), read/write throughput (MB/s), and latency
+      (r_await / w_await in ms). Run 5 samples at 2-second intervals.
+      %util above 80% means the disk is saturated. r_await or w_await
+      above 50ms means latency is critically high.
+    category: "read"
+    command: iostat -xdm 2 5
+
+  - name: "list_processes_in_dstate"
+    description: |
+      List all processes currently in D-state
+      (uninterruptible sleep). These are processes blocked waiting for a disk
+      I/O request to complete. A large number of D-state processes confirms
+      disk saturation. Do NOT kill D-state processes directly — it will hang.
+    category: "read"
+    command: ps aux | awk '$8 == "D" {printf "PID:%-8s USER:%-12s CMD:%s\n", $2, $1, $11}'
+
+  - name: "get_io_per_process"
+    description: |
+      Show disk read/write bandwidth consumed
+      by each active process using iotop. Captures 3 snapshots of only
+      processes that are actively doing I/O. Identifies the top I/O consumer
+      responsible for saturating the disk.
+    category: "read"
+    command: sudo iotop -o -b -n3 -d2 2>/dev/null | head -30
+
+  - name: "check_disk_space_and_inodes"
+    description: |
+      Check filesystem disk space and inode
+      usage on all mounted filesystems. A filesystem at 100% capacity or 100%
+      inode usage will cause severe write latency as the kernel searches for
+      free blocks, contributing to high iowait.
+    category: "read"
+    command: echo '=== Disk Space ===' && df -h && echo '' && echo '=== Inodes ===' && df -i
+
+  - name: "check_disk_health_smart"
+    description: |
+      Run a SMART health check on the primary
+      disk to detect hardware failures, bad sectors, or reallocated sectors
+      that would cause elevated read/write latency.
+      Replace <DEVICE> with the actual device name (e.g. sda, nvme0n1).
+      Requires smartmontools to be installed.
+    category: "read"
+    command: sudo smartctl -H /dev/<DEVICE> 2>/dev/null && sudo smartctl -A /dev/<DEVICE> 2>/dev/null | grep -E 'Reallocated|Pending|Uncorrectable|Temperature'
+
+  - name: "reduce_io_priority_of_process"
+    description: |
+      Lower the I/O scheduling priority of the
+      top I/O consumer to idle class, so it yields disk bandwidth to other
+      processes immediately. This reduces iowait without stopping the process.
+      Replace <PID> with the PID from sc3_get_io_per_process.
+      REQUIRES USER APPROVAL before execution.
+    category: "execute"
+    command: sudo ionice -c 3 -p <PID> && echo 'I/O priority set to idle for PID <PID>'
+
+  - name: "vacuum_journal_logs"
+    description: |
+      Free disk space by removing old systemd
+      journal logs, keeping only the most recent 500 MB. Useful when high
+      iowait is caused by log rotation or a full /var partition.
+      REQUIRES USER APPROVAL before execution.
+    category: "execute"
+    command: sudo journalctl --vacuum-size=500M && df -h /var/log
+
+  - name: "clear_tmp_files"
+    description: |
+      Delete files in /tmp and /var/tmp that are
+      older than 7 days to free disk space. Safe to run as these directories
+      hold temporary data only. Helps when disk full is contributing to iowait.
+      REQUIRES USER APPROVAL before execution.
+    category: "execute"
+    command: sudo find /tmp /var/tmp -mtime +7 -delete && echo 'Temp files older than 7 days removed' && df -h
+
+  - name: "set_io_scheduler"
+    description: |
+      Change the I/O scheduler for a disk device
+      to better match its hardware type. Use 'mq-deadline' for SSDs or NVMe,
+      and 'bfq' for HDDs. This can significantly reduce latency under load.
+      Replace <DEVICE> with device name (e.g. sda). REQUIRES USER APPROVAL.
+    category: "execute"
+    command: echo mq-deadline | sudo tee /sys/block/<DEVICE>/queue/scheduler && cat /sys/block/<DEVICE>/queue/scheduler
+
+  - name: "check_cron_log"
+    description: |
+      Show the most recent cron job executions from
+      the system log to identify which scheduled job started around the time
+      the CPU spike began. Look for entries timestamped within 1-2 minutes
+      before the alert fired.
+    category: "read"
+    command: grep CRON /var/log/syslog | tail -30 || journalctl -u cron --since '15 minutes ago' --no-pager
+
+  - name: "identify_cron_parent_process"
+    description: |
+      Show the process tree of the top CPU consumer
+      to confirm it was spawned by cron. Displays PID, PPID, %CPU, and command.
+      If the PPID chain leads back to crond or cron, the hypothesis is confirmed.
+    category: "read"
+    command: ps -eo pid,ppid,cmd,%cpu --sort=-%cpu | head -10 && echo '' && echo '--- Parent chain of top CPU process ---' && ps -o pid,ppid,cmd -p $(ps aux --sort=-%cpu | awk 'NR==2{print $2}')
+
+  - name: "list_all_crontabs"
+    description: |
+      List all crontab entries for all users and
+      system-wide cron directories. Reveals the full schedule so you can
+      identify overlapping jobs or unexpectedly heavy tasks running simultaneously.
+    category: "read"
+    command: echo '=== root crontab ===' && sudo crontab -l 2>/dev/null; echo '=== /etc/crontab ===' && cat /etc/crontab 2>/dev/null; echo '=== /etc/cron.d ===' && ls /etc/cron.d/ && cat /etc/cron.d/* 2>/dev/null
+
+  - name: "check_cron_job_duration"
+    description: |
+      Search system logs for the start and end
+      timestamps of the suspected cron job to measure how long it actually ran.
+      A job taking significantly longer than expected suggests an inefficient
+      script or data growth issue.
+    category: "read"
+    command: journalctl -u cron --since '30 minutes ago' --no-pager | grep -E 'CMD|session|opened|closed'
+
+  - name: "check_job_nice_value"
+    description: |
+      Show the current nice value and scheduling
+      priority of the cron job process. A nice value of 0 (default) means the
+      job competes equally with production services. A value of +19 means it
+      yields CPU to everything else. Replace <PID> with the cron job PID.
+    category: "read"
+    command: ps -o pid,ni,pri,cmd -p <PID> 2>/dev/null || ps aux --sort=-%cpu | awk 'NR<=5{print $2,$18,$11}' | column -t
+
+  - name: "renice_cron_job"
+    description: |
+      Immediately lower the CPU priority of the
+      running cron job to nice +19 (lowest priority). The job continues running
+      but yields CPU time to all other processes. Takes effect instantly without
+      stopping the job. Replace <PID> with the cron job PID.
+      REQUIRES USER APPROVAL before execution.
+    category: "execute"
+    command: sudo renice +19 -p <PID> && sudo ionice -c 3 -p <PID> && echo 'PID <PID> rescheduled to lowest priority'
+
+  - name: "add_nice_to_crontab"
+    description: |
+      Permanently wrap the cron job command with
+      'nice -n 19 ionice -c 3' to ensure it always runs at lowest priority.
+      This is a long-term fix that prevents future CPU spikes from the same job.
+      Replace <CRON_ENTRY> with the exact crontab line to modify.
+      REQUIRES USER APPROVAL before execution.
+    category: "execute"
+    command: crontab -l | sed 's|<ORIGINAL_CMD>|nice -n 19 ionice -c 3 <ORIGINAL_CMD>|' | crontab - && echo 'Crontab updated with nice/ionice wrapper' && crontab -l

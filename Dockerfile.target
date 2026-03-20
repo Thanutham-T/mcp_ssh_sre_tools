@@ -1,30 +1,147 @@
-FROM debian:bookworm
+# syntax=docker/dockerfile:1
+# ---------------------------------------------------------
+# STAGE 0: base
+# The shared foundation for all target scenarios.
+# ---------------------------------------------------------
+FROM debian:bookworm AS base
 
-# Install SSH server
-RUN apt-get update && apt-get install -y openssh-server iproute2 sudo && \
-    mkdir -p /var/run/sshd
+# Allow customization of the SSH port at build time
+ARG TARGET_SSH_PORT=22
 
-# Create dedicated 'sre-agent' user
+# Install core diagnostic and triage tools required by the SRE toolkit
+RUN apt-get update && apt-get install -y \
+    openssh-server \
+    iproute2 \
+    sudo \
+    procps \
+    lsof \
+    strace \
+    sysstat \
+    iotop \
+    smartmontools \
+    cron \
+    bsdextrautils \
+    python3 \
+    python3-pip \
+    systemd \
+    && pip install py-spy --break-system-packages \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /var/run/sshd
+
+# Create the dedicated 'sre-agent' user
 RUN useradd -m -s /bin/bash sre-agent && \
-    echo 'sre-agent:secretpassword' | chpasswd && \
-    usermod -aG sudo sre-agent
+    usermod -aG sudo sre-agent && \
+    echo "sre-agent ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
-# Allow sudo without password for 'sre-agent'
-RUN echo "sre-agent ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
-
-# Set up SSH directory for the user
+# Set up SSH directory structure for the user
 RUN mkdir -p /home/sre-agent/.ssh && \
-    echo "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDXH3bTnNQMsiKpfprx1dDRCprPdB+SU6i2Fq030O8QkCgSMLXDw84JjOAEwg6Ip4aUNhjCy/feJsrW5blVWUk042Vw8ljZMrQ875/cVFU1209WjCm1ykpyTpV7aPxcNOYnAv5M3IOd3nbXVCAwS7wW1PjhsQeHWfb6KrL9hL9mx68FcdXfA7+MheQVuaq338Qhr0PxOvm7295iZrz8GZTl1stKXqRAFvrUbmVOhQY/szU8WtY54nipLi6oXKJWD+xs7wOiD1VM/oVDDHAkvaLz9XJCFBnhExKGtKIMTFY4UOacnF92OxI68x1UtJfzFCh3rumO5NqmjEfNEX8XDBtD root@Cohh" > /home/sre-agent/.ssh/authorized_keys && \
     chmod 700 /home/sre-agent/.ssh && \
-    chmod 600 /home/sre-agent/.ssh/authorized_keys && \
     chown -R sre-agent:sre-agent /home/sre-agent/.ssh
 
-# Configure SSH server
-RUN sed -i 's/#Port 22/Port 27036/' /etc/ssh/sshd_config
-RUN sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
-RUN sed -i 's/PermitRootLogin prohibit-password/PermitRootLogin no/' /etc/ssh/sshd_config
+# Configure SSH server security and port
+RUN sed -i "s/#Port 22/Port ${TARGET_SSH_PORT}/" /etc/ssh/sshd_config && \
+    sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config && \
+    sed -i 's/PermitRootLogin prohibit-password/PermitRootLogin no/' /etc/ssh/sshd_config
 
-# Expose ssh port
-EXPOSE 27036
+# Expose the custom SSH port
+EXPOSE ${TARGET_SSH_PORT}
 
+# Common Entrypoint script to handle password injection and SSH keys at startup
+RUN <<EOF cat > /usr/local/bin/entrypoint.sh
+#!/bin/bash
+set -e
+echo "sre-agent:\${PASSWORD:-secretpassword}" | chpasswd
+if [ -n "\$SSH_PUBLIC_KEY" ]; then
+    echo "\$SSH_PUBLIC_KEY" > /home/sre-agent/.ssh/authorized_keys
+    chown sre-agent:sre-agent /home/sre-agent/.ssh/authorized_keys
+    chmod 600 /home/sre-agent/.ssh/authorized_keys
+fi
+exec "\$@"
+EOF
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["/usr/sbin/sshd", "-D"]
+
+# ---------------------------------------------------------
+# STAGE: sc1-runaway
+# Scenario 1: Single process spinning CPU
+# ---------------------------------------------------------
+FROM base AS sc1-runaway
+RUN <<EOF cat > /usr/local/bin/runaway.py
+import os, time
+print(f"[runaway] CPU spinner active (PID {os.getpid()})")
+# Some initial "work" to show up in top
+for i in range(10**6):
+    _ = i * i
+while True:
+    pass
+EOF
+# Start the runaway script in background, then sshd in foreground
+CMD ["sh", "-c", "python3 /usr/local/bin/runaway.py & /usr/sbin/sshd -D"]
+
+# ---------------------------------------------------------
+# STAGE: sc2-forkbomb
+# Scenario 2: Process explosion (bounded) + high load
+# ---------------------------------------------------------
+FROM base AS sc2-forkbomb
+RUN apt-get update && apt-get install -y stress && rm -rf /var/lib/apt/lists/*
+RUN <<EOF cat > /usr/local/bin/spawn_procs.sh
+#!/bin/bash
+echo "[forkbomb] Spawning 200 sleep processes to drive up process count..."
+for i in \$(seq 1 200); do
+    sleep 600 &
+done
+echo "[forkbomb] Starting CPU stress..."
+exec stress --cpu \$(nproc) --timeout 86400
+EOF
+RUN chmod +x /usr/local/bin/spawn_procs.sh
+# Run the spawner as the sre-agent user
+CMD ["sh", "-c", "su -s /bin/sh sre-agent -c '/usr/local/bin/spawn_procs.sh &' && /usr/sbin/sshd -D"]
+
+# ---------------------------------------------------------
+# STAGE: sc3-iowait
+# Scenario 3: Disk I/O saturation using fio
+# ---------------------------------------------------------
+FROM base AS sc3-iowait
+RUN apt-get update && apt-get install -y sysstat fio && rm -rf /var/lib/apt/lists/*
+RUN <<EOF cat > /usr/local/bin/io_stress.sh
+#!/bin/bash
+echo "[iowait] Starting disk I/O load..."
+mkdir -p /var/tmp/io-stress
+exec fio \\
+    --name=iowait-sim \\
+    --filename=/var/tmp/io-stress/testfile \\
+    --rw=randrw \\
+    --bs=4k \\
+    --size=512m \\
+    --numjobs=4 \\
+    --iodepth=32 \\
+    --runtime=86400 \\
+    --time_based \\
+    --group_reporting \\
+    --output-format=normal
+EOF
+RUN chmod +x /usr/local/bin/io_stress.sh
+CMD ["sh", "-c", "/usr/local/bin/io_stress.sh & /usr/sbin/sshd -D"]
+
+# ---------------------------------------------------------
+# STAGE: sc4-cronjob
+# Scenario 4: Periodic heavy CPU spikes via Cron
+# ---------------------------------------------------------
+FROM base AS sc4-cronjob
+RUN apt-get update && apt-get install -y stress && rm -rf /var/lib/apt/lists/*
+RUN <<EOF cat > /usr/local/bin/heavy_batch.sh
+#!/bin/bash
+echo "[cronjob] Running heavy batch job at \$(date)"
+dd if=/dev/urandom of=/tmp/batchdata.bin bs=1M count=256 2>/dev/null
+gzip -f -9 /tmp/batchdata.bin
+stress --cpu \$(nproc) --timeout 300
+rm /tmp/batchdata.bin.gz
+EOF
+RUN chmod +x /usr/local/bin/heavy_batch.sh
+# Schedule to run every 5 minutes as sre-agent
+RUN echo "*/5 * * * * sre-agent /usr/local/bin/heavy_batch.sh >> /var/log/heavy_batch.log 2>&1" > /etc/cron.d/heavy-batch && \
+    chmod 0644 /etc/cron.d/heavy-batch
+# Start cron daemon and sshd
+CMD ["sh", "-c", "cron && /usr/sbin/sshd -D"]

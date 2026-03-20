@@ -1,23 +1,121 @@
 services:
-  # Target server we want to manage via SSH
-  target-host:
+
+  # ────────────────────────────────────────────────
+  # Scenario 1 — Runaway Single Process
+  # Symptom: single python3 process spinning at ~100% CPU (one core)
+  # ────────────────────────────────────────────────
+  sc1-runaway:
     build:
       context: .
       dockerfile: Dockerfile.target
+      target: sc1-runaway
+      args:
+        TARGET_SSH_PORT: 22011
+    hostname: sc1-runaway
     environment:
-      - PASSWORD=secretpassword
+      - PASSWORD=${SSH_PASSWORD:-secretpassword}
+      - SSH_PUBLIC_KEY=${SSH_PUBLIC_KEY:-}
+      - SSH_PORT=22011
+    cap_add:
+      - SYS_PTRACE
+    networks:
+      sre_net:
+        ipv4_address: 10.25.0.11
 
-  # The MCP SRE Tool server
+  # ────────────────────────────────────────────────
+  # Scenario 2 — Fork Bomb / Process Explosion
+  # Symptom: 200+ sleep processes + stress workers → high load average & context switches
+  # ────────────────────────────────────────────────
+  sc2-forkbomb:
+    build:
+      context: .
+      dockerfile: Dockerfile.target
+      target: sc2-forkbomb
+      args:
+        TARGET_SSH_PORT: 22012
+    hostname: sc2-forkbomb
+    environment:
+      - PASSWORD=${SSH_PASSWORD:-secretpassword}
+      - SSH_PUBLIC_KEY=${SSH_PUBLIC_KEY:-}
+      - SSH_PORT=22012
+    cap_add:
+      - SYS_PTRACE
+    networks:
+      sre_net:
+        ipv4_address: 10.25.0.12
+
+  # ────────────────────────────────────────────────
+  # Scenario 3 — Disk I/O Wait
+  # Symptom: fio random read/write → high %iowait, D-state processes
+  # ────────────────────────────────────────────────
+  sc3-iowait:
+    build:
+      context: .
+      dockerfile: Dockerfile.target
+      target: sc3-iowait
+      args:
+        TARGET_SSH_PORT: 22013
+    hostname: sc3-iowait
+    environment:
+      - PASSWORD=${SSH_PASSWORD:-secretpassword}
+      - SSH_PUBLIC_KEY=${SSH_PUBLIC_KEY:-}
+      - SSH_PORT=22013
+    cap_add:
+      - SYS_PTRACE
+    networks:
+      sre_net:
+        ipv4_address: 10.25.0.13
+
+  # ────────────────────────────────────────────────
+  # Scenario 4 — Scheduled Job Spike (Cron)
+  # Symptom: heavy_batch.sh fires every 5 min via cron → CPU spike, no nice/ionice
+  # ────────────────────────────────────────────────
+  sc4-cronjob:
+    build:
+      context: .
+      dockerfile: Dockerfile.target
+      target: sc4-cronjob
+      args:
+        TARGET_SSH_PORT: 22014
+    hostname: sc4-cronjob
+    environment:
+      - PASSWORD=${SSH_PASSWORD:-secretpassword}
+      - SSH_PUBLIC_KEY=${SSH_PUBLIC_KEY:-}
+      - SSH_PORT=22014
+    cap_add:
+      - SYS_PTRACE
+    networks:
+      sre_net:
+        ipv4_address: 10.25.0.14
+
+  # ────────────────────────────────────────────────
+  # MCP SRE Tool server
+  # ────────────────────────────────────────────────
   mcp-server:
     build:
       context: .
       dockerfile: Dockerfile
-    depends_on:
-      - target-host
     ports:
       - "8088:8000"
     environment:
-      - SSH_PASSWORD=secretpassword
-      - SSH_KEY= # Optional, leave empty to test password auth
+      - SSH_PASSWORD=${SSH_PASSWORD:-}
+      - SSH_KEY=${SSH_KEY:-}
+      - BWS_ACCESS_TOKEN=${BWS_ACCESS_TOKEN:-}
+      - SSH_KEY_SECRET_ID=${SSH_KEY_SECRET_ID:-}
     volumes:
       - .:/app
+    networks:
+      sre_net:
+        ipv4_address: 10.25.0.100
+      dify_network:
+
+
+networks:
+  sre_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.25.0.0/16
+  dify_network:
+    external: true
+    name: dify_default
